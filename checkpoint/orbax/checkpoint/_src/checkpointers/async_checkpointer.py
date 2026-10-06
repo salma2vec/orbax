@@ -17,6 +17,7 @@
 import asyncio
 import concurrent.futures
 import datetime
+import functools
 import sys
 import threading
 import time
@@ -514,28 +515,23 @@ class AsyncCheckpointer(checkpointer.Checkpointer):
       self, directory: epath.Path, *, force: bool
   ) -> None:
     """Removes existing destination if force=True, or checks for collisions."""
-    skip = self._file_options.skip_sync_file_validations
-
     # 1. Force overwrite: only the primary host performs cleanup.
     if force:
       if not utils.is_primary_host(self._primary_host):
         return
-      should_remove = skip or await async_path.exists(directory)
-      if should_remove:
+      if await async_path.exists(directory):
         logging.info(
             '[process=%s] Specified `force`: removing existing directory.',
             multihost.process_index(),
         )
         await async_path.rmtree(
             directory,
-            missing_ok=skip,
         )  # Post-sync handled by create_tmp_directory.
       return
 
     # 2. Collision validation: verify destination directory does not exist.
-    if not skip:
-      if await async_path.exists(directory):
-        raise ValueError(f'Destination {directory} already exists.')
+    if await async_path.exists(directory):
+      raise ValueError(f'Destination {directory} already exists.')
 
   async def _save(
       self,
@@ -545,18 +541,24 @@ class AsyncCheckpointer(checkpointer.Checkpointer):
       **kwargs,
   ):
     directory = tmpdir.get_final()
-    await self._prepare_destination_async(directory, force=force)
-
     commit_ops = []
     if self._create_directories_asynchronously:
+      # `STEP_DIRECTORY_CREATION` is sent only after `pre_create_fn` and
+      # `tmpdir.create()` finish, so commit futures wait for preparation.
+      # Removing an existing destination thus counts toward `timeout_secs`
+      # and the `*_directory_creation_secs` metrics.
       commit_ops.append(
           atomicity.create_all_async(
               [tmpdir],
               completion_signals=_DIRECTORY_CREATION_SIGNALS,
               multiprocessing_options=self._multiprocessing_options,
+              pre_create_fn=functools.partial(
+                  self._prepare_destination_async, directory, force=force
+              ),
           )
       )
     else:
+      await self._prepare_destination_async(directory, force=force)
       await self.create_temporary_path(tmpdir)
     # Run copy ops.
     # Try to save using new CheckpointArgs API if supported by the handler.
@@ -610,7 +612,10 @@ class AsyncCheckpointer(checkpointer.Checkpointer):
         save method.
 
     Raises:
-      ValueError if the provided directory already exists.
+      ValueError if the provided directory already exists. With
+      `AsyncOptions.create_directories_asynchronously=True`, this is
+      raised when the background save is awaited (e.g. by
+      `wait_until_finished`) rather than by `save`.
     """
     checkpoint_start_time = (
         save_context.checkpoint_start_time

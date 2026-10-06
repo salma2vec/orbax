@@ -1128,7 +1128,9 @@ class SaveLoadTestSuite:
         else:
           with self.assertRaises(BaseException):
             r.result()
-          self.assertGreaterEqual(time.time() - start, timeout)
+          # The primary's error is signaled to other hosts, so they also fail
+          # fast instead of waiting for the coordination timeout.
+          self.assertLessEqual(time.time() - start, timeout - 1)
 
     def test_save_checkpointables_directory_consistency_failure(self):
       if jax.process_count() <= 1:

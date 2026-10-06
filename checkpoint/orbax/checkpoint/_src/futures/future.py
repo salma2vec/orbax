@@ -32,6 +32,7 @@ from typing_extensions import Protocol
 
 PyTree = Any
 _SIGNAL_ACTION_SUCCESS = 'signal_action_success'
+_SIGNAL_ACTION_ERROR = 'signal_action_error'
 
 # Namespace for awaitable-signal keys. Scoped per save via `signals_namespace()`
 # so that managers in the same process do not share keys.
@@ -281,15 +282,28 @@ def wait_for_signals(
         signal, operation_id
     )
     client = signaling_client.get_signaling_client()
-    client.blocking_key_value_get(barrier_key, timeout_secs)
+    signal_value = client.blocking_key_value_get(barrier_key, timeout_secs)
+    if signal_value.startswith(_SIGNAL_ACTION_ERROR):
+      raise ValueError(signal_value.removeprefix(f'{_SIGNAL_ACTION_ERROR}:'))
 
 
 def set_signals(
     send_signals: Sequence[synchronization.HandlerAwaitableSignal],
     *,
     operation_id: str,
+    error: BaseException | None = None,
 ):
-  """Sets the barrier keys for the signals using send_signals."""
+  """Sets the barrier keys for the signals using send_signals.
+
+  Args:
+    send_signals: Signals to set.
+    operation_id: The operation id to use for the barrier keys.
+    error: If set, records this error instead of success, which makes
+      `wait_for_signals` raise.
+  """
+  value = _SIGNAL_ACTION_SUCCESS
+  if error is not None:
+    value = f'{_SIGNAL_ACTION_ERROR}:{error}'
   for signal in send_signals:
     logging.vlog(
         1,
@@ -304,9 +318,7 @@ def set_signals(
         signal, operation_id
     )
     client = signaling_client.get_signaling_client()
-    client.key_value_set(
-        barrier_key, _SIGNAL_ACTION_SUCCESS, allow_overwrite=True
-    )
+    client.key_value_set(barrier_key, value, allow_overwrite=True)
 
 
 class _SignalingThread(threading.Thread):
@@ -421,6 +433,9 @@ class _SignalingThread(threading.Thread):
             e,
         )
         self._exception = e
+        set_signals(
+            self._send_signals, operation_id=self._operation_id, error=e
+        )
 
   def cancel(self):
     """Cancels the thread's background execution."""

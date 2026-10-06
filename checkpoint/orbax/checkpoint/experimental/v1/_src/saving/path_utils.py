@@ -23,7 +23,6 @@ from orbax.checkpoint.experimental.v1._src.context import context as context_lib
 from orbax.checkpoint.experimental.v1._src.deletion import metadata as deletion_metadata
 from orbax.checkpoint.experimental.v1._src.path import types as path_types
 from orbax.checkpoint.experimental.v1._src.synchronization import multihost
-from orbax.checkpoint.experimental.v1._src.synchronization import synchronization
 
 
 def get_temporary_path(
@@ -73,17 +72,7 @@ async def remove_existing_path(
         '[process=%s] Specified `overwrite`: removing existing path.',
         multihost.process_index(),
     )
-    await async_path.rmtree(
-        path, missing_ok=context.file_options.skip_sync_file_validations
-    )
-  await multihost.sync_global_processes(
-      multihost.unique_barrier_key(
-          'save_checkpointables_async:rmtree',
-          prefix=context.multiprocessing_options.barrier_sync_key_prefix,
-      ),
-      operation_id=synchronization.get_operation_id(),
-      processes=context.multiprocessing_options.active_processes,
-  )
+    await async_path.rmtree(path)
 
 
 async def maybe_overwrite_existing(
@@ -103,31 +92,8 @@ async def maybe_overwrite_existing(
     ValueError: If the path exists and overwrite is False.
   """
   await deletion_metadata.ensure_available(path)
-  if context.file_options.skip_sync_file_validations:
-    if overwrite:
-      await remove_existing_path(path, context=context)
-    return
-  # Sync before and after existence check, since otherwise the processes may
-  # not agree and it is possible for one process to run ahead and create the
-  # directory before another has checked for its existence.
-  await multihost.sync_global_processes(
-      multihost.unique_barrier_key(
-          'save_checkpointables_async:maybe_overwrite_existing:pre',
-          prefix=context.multiprocessing_options.barrier_sync_key_prefix,
-      ),
-      operation_id=synchronization.get_operation_id(),
-      processes=context.multiprocessing_options.active_processes,
-  )
   if await async_path.exists(path):
     if overwrite:
       await remove_existing_path(path, context=context)
     else:
       raise ValueError(f'Destination {path} already exists.')
-  await multihost.sync_global_processes(
-      multihost.unique_barrier_key(
-          'save_checkpointables_async:maybe_overwrite_existing:post',
-          prefix=context.multiprocessing_options.barrier_sync_key_prefix,
-      ),
-      operation_id=synchronization.get_operation_id(),
-      processes=context.multiprocessing_options.active_processes,
-  )

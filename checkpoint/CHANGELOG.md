@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- With `create_directories_asynchronously=True`, `AsyncCheckpointer.save()` and
+  #v1 async saves check for or remove an existing destination in the background.
+  With `force=False` / `overwrite=False`, an existing destination now raises
+  when the save is awaited (e.g. `wait_until_finished()`), not in `save()`.
+
+### Deprecated
+
+- `FileOptions.skip_sync_file_validations` (V0 and #v1) is a no-op and will be
+  removed in a future release.
+
 ## [0.12.8] - 2026-10-20
 
 ### Added
