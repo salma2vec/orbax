@@ -21,7 +21,7 @@ import dataclasses
 import functools
 import os
 import time
-from typing import Any, Callable, Dict, Sequence, Set, TypeAlias, Union, cast
+from typing import Any, Callable, Dict, Iterable, Sequence, Set, TypeAlias, Union, cast
 import warnings
 
 from absl import logging
@@ -35,6 +35,7 @@ from orbax.checkpoint._src.metadata import array_metadata as array_metadata_lib
 from orbax.checkpoint._src.metadata import array_metadata_store as array_metadata_store_lib
 from orbax.checkpoint._src.metadata import sharding as sharding_metadata
 from orbax.checkpoint._src.metadata import value as value_metadata
+from orbax.checkpoint._src.multihost import colocated_transport
 from orbax.checkpoint._src.multihost import dispatchers
 from orbax.checkpoint._src.multihost import multihost
 from orbax.checkpoint._src.multihost import multislice
@@ -59,6 +60,8 @@ SingleReplicaArrayRestoreArgs = (
 
 
 _SHARDING_FILE_NAME = '_sharding'
+# Memory kinds of host-offloaded arrays.
+_HOST_MEMORY_KINDS = frozenset({'pinned_host', 'unpinned_host'})
 
 
 def check_array_values(
@@ -1516,6 +1519,10 @@ class ArrayHandler(types.TypeHandler):
     assert all([info.enable_pinned_host_transfer for info in infos]) or all(
         [not info.enable_pinned_host_transfer for info in infos]
     )
+    if isinstance(self._dispatcher, dispatchers.ColocatedPythonDispatcher):
+      colocated_transport.validate_single_device_list(
+          arrays, [info.name for info in infos]
+      )
 
     future_list = []
     if self._enable_write_sharding_file:
@@ -1642,18 +1649,46 @@ class ArrayHandler(types.TypeHandler):
       result_specs = await _get_abstract_arrays(
           args, shardings, self._array_metadata_store, infos
       )
-      ret = self._dispatcher.dispatch(
-          _sync_deserialize_arrays,
-          result_specs=result_specs,
-          func_kwargs={
-              'infos': infos,
-              'args': args,
-              'shardings': shardings,
-              'metadata_key': self._metadata_key,
-              'array_metadata_store': self._array_metadata_store,
-          },
-      )
-      jax.block_until_ready(ret)
+      if isinstance(self._dispatcher, dispatchers.ColocatedPythonDispatcher):
+        colocated_transport.validate_single_device_list(
+            result_specs, [info.name for info in infos]
+        )
+      # Bound worker memory by restoring in batches, each reaching its final
+      # sharding before the next one starts.
+      batches: Iterable[list[int]] = [list(range(len(infos)))]
+      limiter = infos[0].device_host_byte_limiter
+      if isinstance(limiter, limits.LimitInFlightBytes):
+        batches = worker_memory_utils.next_memory_budgeted_batch_indices(
+            result_specs, limiter.max_bytes, dispatcher=self._dispatcher
+        )
+      elif any(
+          spec.sharding.memory_kind in _HOST_MEMORY_KINDS
+          for spec in result_specs
+      ):
+        logging.warning(
+            'Restoring host-offloaded jax.Arrays through the %s dispatcher'
+            ' without a worker memory budget. Workers read all shards before'
+            ' moving them to their final memory, so host memory usage peaks at'
+            ' about twice the size of the host-offloaded arrays. Set'
+            ' `PyTreeCheckpointHandler(restore_device_host_concurrent_gb=...)`'
+            ' to restore in memory-budgeted batches.',
+            self._dispatcher.name(),
+        )
+      ret = []
+      for batch in batches:
+        batch_ret = self._dispatcher.dispatch(
+            _sync_deserialize_arrays,
+            result_specs=[result_specs[i] for i in batch],
+            func_kwargs={
+                'infos': [infos[i] for i in batch],
+                'args': [args[i] for i in batch],
+                'shardings': [shardings[i] for i in batch],
+                'metadata_key': self._metadata_key,
+                'array_metadata_store': self._array_metadata_store,
+            },
+        )
+        jax.block_until_ready(batch_ret)
+        ret.extend(batch_ret)
     if logging.vlog_is_on(1):
       for a in ret:
         logging.vlog(

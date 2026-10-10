@@ -14,11 +14,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - #v1 Add `delete` and `delete_async` free functions and
   `training.Checkpointer.delete` / `delete_async` for deleting an entire
   checkpoint or a single named checkpointable.
+- `PyTreeCheckpointHandler(restore_device_host_concurrent_gb=...)` bounds the
+  memory that dispatcher workers (e.g. Pathways colocated Python) use when
+  restoring, by restoring `jax.Array`s in memory-budgeted batches. It is off by
+  default; dispatcher restores of host-offloaded arrays without it log a
+  warning.
+
+### Changed
+
+- Colocated Python saves and restores now fail before starting, naming the
+  affected parameters, when the arrays span multiple device lists. Previously,
+  a save could succeed if memory-limited batching happened to keep each
+  dispatch on a single device list.
 
 ### Fixed
 
 - Fix `CheckpointManager.wait_until_finished()` to only accumulate
   `wait_for_prev_duration_secs` when called from the main thread.
+- Colocated Python no longer copies accelerator memory kinds (e.g.
+  `pinned_host` for host-offloaded arrays) onto colocated CPU shardings, which
+  broke saving and restoring such arrays.
 
 ## [0.12.7] - 2026-10-06
 
