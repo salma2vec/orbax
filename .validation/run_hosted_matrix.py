@@ -33,7 +33,7 @@ def main():
         'orbax-base': 'b3df0a14578c75afbb00f60f56420b9f674fc93d',
         'orbax-fixed': 'eafa34001f9d20008b12915a426704f62d644121',
         'grain-base': 'd2adadec1b275251b098215abe5c6df8b16ed6da',
-        'grain-fixed': '762a635346172a6fc2ed61f44640d467e61de27b',
+        'grain-fixed': '7980fba53631e1d88228b01e835af5d0c970299b',
     }
     wheel = importlib.metadata.distribution('grain')
     assert wheel.version == '0.2.18'
@@ -43,7 +43,7 @@ def main():
         root = Path(temporary)
         grain_repo = root / 'grain-repo'
         subprocess.run([
-            'git', 'clone', '--quiet', '--depth', '2', '--branch',
+            'git', 'clone', '--quiet', '--depth', '3', '--branch',
             'codex/flatmap-exhausted-checkpoint',
             'https://github.com/salma2vec/grain.git', str(grain_repo),
         ], check=True)

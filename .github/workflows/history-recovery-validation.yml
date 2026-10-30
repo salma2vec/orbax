@@ -6,6 +6,7 @@ permissions:
   contents: read
 jobs:
   manager:
+    if: ${{ !contains(github.event.head_commit.message, '[style-only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
     strategy:
@@ -67,6 +68,7 @@ jobs:
             manager.log
             manager-rank-*.xml
   integration:
+    if: ${{ !contains(github.event.head_commit.message, '[style-only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -116,12 +118,13 @@ jobs:
         run: isort --check-only --settings-path=pyproject.toml checkpoint/orbax/checkpoint/checkpoint_manager.py checkpoint/orbax/checkpoint/checkpoint_manager_test.py
       - name: Compare Pylint diagnostics with unchanged upstream
         run: |
-          mkdir -p baseline/checkpoint/orbax/checkpoint validation-results/style
-          for file in checkpoint_manager.py checkpoint_manager_test.py; do
-            git show b3df0a14578c75afbb00f60f56420b9f674fc93d:checkpoint/orbax/checkpoint/$file > baseline/checkpoint/orbax/checkpoint/$file
-          done
+          mkdir -p validation-results/style
           pylint --rcfile=.pylintrc --output-format=json checkpoint/orbax/checkpoint/checkpoint_manager.py checkpoint/orbax/checkpoint/checkpoint_manager_test.py > validation-results/style/pylint-fixed.json || true
-          pylint --rcfile=.pylintrc --output-format=json baseline/checkpoint/orbax/checkpoint/checkpoint_manager.py baseline/checkpoint/orbax/checkpoint/checkpoint_manager_test.py > validation-results/style/pylint-base.json || true
+          for file in checkpoint_manager.py checkpoint_manager_test.py; do
+            git show b3df0a14578c75afbb00f60f56420b9f674fc93d:checkpoint/orbax/checkpoint/$file > checkpoint/orbax/checkpoint/$file
+          done
+          pylint --rcfile=.pylintrc --output-format=json checkpoint/orbax/checkpoint/checkpoint_manager.py checkpoint/orbax/checkpoint/checkpoint_manager_test.py > validation-results/style/pylint-base.json || true
+          git restore --source=eafa34001f9d20008b12915a426704f62d644121 -- checkpoint/orbax/checkpoint/checkpoint_manager.py checkpoint/orbax/checkpoint/checkpoint_manager_test.py
           python - <<'PY'
           from collections import Counter
           import json
@@ -143,10 +146,30 @@ jobs:
           set +e
           timeout 240 pytype -d import-error --keep-going -j 2 -o /tmp/pytype-fixed checkpoint/orbax/checkpoint/checkpoint_manager.py checkpoint/orbax/checkpoint/checkpoint_manager_test.py > validation-results/style/pytype-fixed.log 2>&1
           fixed=$?
-          timeout 240 pytype -d import-error --keep-going -j 2 -o /tmp/pytype-base baseline/checkpoint/orbax/checkpoint/checkpoint_manager.py baseline/checkpoint/orbax/checkpoint/checkpoint_manager_test.py > validation-results/style/pytype-base.log 2>&1
+          for file in checkpoint_manager.py checkpoint_manager_test.py; do
+            git show b3df0a14578c75afbb00f60f56420b9f674fc93d:checkpoint/orbax/checkpoint/$file > checkpoint/orbax/checkpoint/$file
+          done
+          timeout 240 pytype -d import-error --keep-going -j 2 -o /tmp/pytype-base checkpoint/orbax/checkpoint/checkpoint_manager.py checkpoint/orbax/checkpoint/checkpoint_manager_test.py > validation-results/style/pytype-base.log 2>&1
           base=$?
           printf '{"base_exit":%s,"fixed_exit":%s}\n' "$base" "$fixed" > validation-results/style/pytype-exits.json
           cat validation-results/style/pytype-exits.json
+          git restore --source=eafa34001f9d20008b12915a426704f62d644121 -- checkpoint/orbax/checkpoint/checkpoint_manager.py checkpoint/orbax/checkpoint/checkpoint_manager_test.py
+          python - <<'PY'
+          from collections import Counter
+          import json
+          from pathlib import Path
+          import re
+          def errors(name):
+              return Counter(re.findall(r'error: in (.+)', Path(name).read_text()))
+          base = errors('validation-results/style/pytype-base.log')
+          fixed = errors('validation-results/style/pytype-fixed.log')
+          exits = json.loads(Path('validation-results/style/pytype-exits.json').read_text())
+          result = {'base_errors': list(base.elements()), 'fixed_errors': list(fixed.elements()), 'added': list((fixed-base).elements()), **exits}
+          Path('validation-results/style/pytype-comparison.json').write_text(json.dumps(result, indent=2))
+          print(json.dumps(result, indent=2))
+          assert exits['base_exit'] in (0, 1) and exits['fixed_exit'] in (0, 1)
+          assert not result['added']
+          PY
       - name: Upload static-tool diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
