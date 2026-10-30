@@ -1,0 +1,155 @@
+name: Checkpoint history recovery validation
+on:
+  push:
+    branches: [codex/verify-orbax-history-20261030]
+permissions:
+  contents: read
+jobs:
+  manager:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12']
+    env:
+      JAX_PLATFORMS: cpu
+      XLA_FLAGS: --xla_force_host_platform_device_count=2 --xla_cpu_multi_thread_eigen=false
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      TEST_TMPDIR: /tmp/orbax-history-tests
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: eafa34001f9d20008b12915a426704f62d644121
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install native package and manager test dependencies
+        run: |
+          python -m pip install --no-cache-dir -e ./checkpoint 'jax[cpu]==0.10.2' flax optax pytest pytest-subtests portpicker chex mock grpcio-tools google-cloud-logging
+          cd checkpoint
+          python -m grpc_tools.protoc -I=. --python_out=. --grpc_python_out=. $(find orbax/checkpoint/ -name '*.proto')
+          python -m pip freeze > ../environment.txt
+      - name: Verify all seven regressions fail on unchanged upstream
+        working-directory: checkpoint
+        run: |
+          git show b3df0a14578c75afbb00f60f56420b9f674fc93d:checkpoint/orbax/checkpoint/checkpoint_manager.py > orbax/checkpoint/checkpoint_manager.py
+          set +e
+          timeout 300 python orbax/checkpoint/_src/testing/oss/run_multihost.py --num_processes=1 --tpu_chips_per_process=0 pytest orbax/checkpoint/checkpoint_manager_test.py -q -k 'async_error_multiple_steps or async_finalization_error_preserves_history' --junitxml=../baseline.xml > ../baseline.log 2>&1
+          result=$?
+          set -e
+          cat ../baseline.log
+          git restore --source=eafa34001f9d20008b12915a426704f62d644121 -- orbax/checkpoint/checkpoint_manager.py
+          test "$result" -eq 1
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('../baseline.xml').getroot()
+          failures = root.findall('.//testcase/failure')
+          errors = root.findall('.//testcase/error')
+          assert len(failures) == 7 and not errors, (len(failures), len(errors))
+          PY
+      - name: Run complete manager suite with four CPU processes
+        working-directory: checkpoint
+        run: |
+          timeout 1500 python orbax/checkpoint/_src/testing/oss/run_multihost.py --num_processes=4 --tpu_chips_per_process=0 pytest orbax/checkpoint/checkpoint_manager_test.py -q --junitxml=../manager-rank-{rank}.xml 2>&1 | tee ../manager.log
+      - name: Upload exact-head test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: orbax-history-python-${{ matrix.python }}
+          path: |
+            environment.txt
+            baseline.log
+            baseline.xml
+            manager.log
+            manager-rank-*.xml
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      JAX_PLATFORMS: cpu
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: eafa34001f9d20008b12915a426704f62d644121
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
+        with:
+          python-version: '3.11'
+      - name: Install native checkpoint and data pipeline dependencies
+        run: |
+          python -m pip install --no-cache-dir -e ./source/checkpoint 'jax[cpu]==0.10.2' flax optax pytest portpicker chex mock google-cloud-logging 'grain==0.2.18' 'array-record==0.8.3' 'cloudpickle==3.1.2'
+      - name: Verify four Orbax and Grain source combinations
+        run: |
+          python .validation/run_hosted_matrix.py --orbax-repo "$PWD/source" --case-script .validation/resume_bundle.py --output validation-results/integration
+      - name: Upload bridge recovery evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: orbax-grain-integration
+          path: validation-results/integration
+  style:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: eafa34001f9d20008b12915a426704f62d644121
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
+        with:
+          python-version: '3.11'
+      - name: Install repository static tools
+        run: python -m pip install 'pylint==4.0.5' pylint-per-file-ignores 'isort==6.0.1' 'pytype==2024.10.11'
+      - name: Check import formatting
+        run: isort --check-only --settings-path=pyproject.toml checkpoint/orbax/checkpoint/checkpoint_manager.py checkpoint/orbax/checkpoint/checkpoint_manager_test.py
+      - name: Compare Pylint diagnostics with unchanged upstream
+        run: |
+          mkdir -p baseline/checkpoint/orbax/checkpoint validation-results/style
+          for file in checkpoint_manager.py checkpoint_manager_test.py; do
+            git show b3df0a14578c75afbb00f60f56420b9f674fc93d:checkpoint/orbax/checkpoint/$file > baseline/checkpoint/orbax/checkpoint/$file
+          done
+          pylint --rcfile=.pylintrc --output-format=json checkpoint/orbax/checkpoint/checkpoint_manager.py checkpoint/orbax/checkpoint/checkpoint_manager_test.py > validation-results/style/pylint-fixed.json || true
+          pylint --rcfile=.pylintrc --output-format=json baseline/checkpoint/orbax/checkpoint/checkpoint_manager.py baseline/checkpoint/orbax/checkpoint/checkpoint_manager_test.py > validation-results/style/pylint-base.json || true
+          python - <<'PY'
+          from collections import Counter
+          import json
+          from pathlib import Path
+          def fingerprints(name):
+              data = json.loads(Path(name).read_text())
+              return Counter((Path(d['path']).name, d['obj'], d['message-id'], d['message']) for d in data)
+          base = fingerprints('validation-results/style/pylint-base.json')
+          fixed = fingerprints('validation-results/style/pylint-fixed.json')
+          added = list((fixed - base).elements())
+          result = {'base_diagnostics': sum(base.values()), 'fixed_diagnostics': sum(fixed.values()), 'added': added}
+          Path('validation-results/style/pylint-comparison.json').write_text(json.dumps(result, indent=2))
+          print(json.dumps(result, indent=2))
+          assert not added, added
+          PY
+      - name: Record exact repository Pytype command on baseline and fix
+        if: always()
+        run: |
+          set +e
+          timeout 240 pytype -d import-error --keep-going -j 2 -o /tmp/pytype-fixed checkpoint/orbax/checkpoint/checkpoint_manager.py checkpoint/orbax/checkpoint/checkpoint_manager_test.py > validation-results/style/pytype-fixed.log 2>&1
+          fixed=$?
+          timeout 240 pytype -d import-error --keep-going -j 2 -o /tmp/pytype-base baseline/checkpoint/orbax/checkpoint/checkpoint_manager.py baseline/checkpoint/orbax/checkpoint/checkpoint_manager_test.py > validation-results/style/pytype-base.log 2>&1
+          base=$?
+          printf '{"base_exit":%s,"fixed_exit":%s}\n' "$base" "$fixed" > validation-results/style/pytype-exits.json
+          cat validation-results/style/pytype-exits.json
+      - name: Upload static-tool diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: orbax-history-static-diagnostics
+          path: validation-results/style
