@@ -6,7 +6,7 @@ permissions:
   contents: read
 jobs:
   manager:
-    if: ${{ !contains(github.event.head_commit.message, '[style-only]') && !contains(github.event.head_commit.message, '[focused-only]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[style-only]') && !contains(github.event.head_commit.message, '[focused-only]') && !contains(github.event.head_commit.message, '[single-only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
     strategy:
@@ -68,7 +68,7 @@ jobs:
             manager.log
             manager-rank-*.xml
   integration:
-    if: ${{ !contains(github.event.head_commit.message, '[style-only]') && !contains(github.event.head_commit.message, '[focused-only]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[style-only]') && !contains(github.event.head_commit.message, '[focused-only]') && !contains(github.event.head_commit.message, '[single-only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -101,7 +101,7 @@ jobs:
           name: orbax-grain-integration
           path: validation-results/integration
   style:
-    if: ${{ !contains(github.event.head_commit.message, '[focused-only]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[focused-only]') && !contains(github.event.head_commit.message, '[single-only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -213,3 +213,39 @@ jobs:
           path: |
             focused.log
             focused-rank-*.xml
+  single:
+    if: ${{ contains(github.event.head_commit.message, '[single-only]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12']
+    env:
+      JAX_PLATFORMS: cpu
+      XLA_FLAGS: --xla_force_host_platform_device_count=8 --xla_cpu_multi_thread_eigen=false
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      TEST_TMPDIR: /tmp/orbax-single-tests
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: eafa34001f9d20008b12915a426704f62d644121
+          persist-credentials: false
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install native package and manager test dependencies
+        run: python -m pip install --no-cache-dir -e ./checkpoint 'jax[cpu]==0.10.2' flax optax pytest pytest-subtests portpicker chex mock google-cloud-logging
+      - name: Run all manager tests except the separately validated multihost broadcast control
+        working-directory: checkpoint
+        run: |
+          timeout --kill-after=15s 600 python orbax/checkpoint/_src/testing/oss/run_multihost.py --num_processes=1 --tpu_chips_per_process=0 pytest orbax/checkpoint/checkpoint_manager_test.py -vv -k 'not single_host_load_and_broadcast' -o faulthandler_timeout=120 --junitxml=../single-manager.xml 2>&1 | tee ../single-manager.log
+      - name: Upload complete one-process test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: orbax-single-python-${{ matrix.python }}
+          path: |
+            single-manager.log
+            single-manager.xml
